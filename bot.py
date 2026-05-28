@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from papolo_bot import db, handlers
+from papolo_bot import conversations, db, handlers  # noqa: F401 (conversations registers deploy callbacks at import)
 
 load_dotenv()
 

@@ -37,6 +37,26 @@ CREATE TABLE IF NOT EXISTS agent_state (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (conversation_uuid) REFERENCES conversations(uuid)
 );
+
+CREATE TABLE IF NOT EXISTS deployments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_uuid TEXT NOT NULL,
+    github_repo_name TEXT,
+    github_repo_url TEXT,
+    coolify_app_uuid TEXT,
+    preview_url TEXT,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (conversation_uuid) REFERENCES conversations(uuid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_conv
+    ON deployments(conversation_uuid);
+
+CREATE INDEX IF NOT EXISTS idx_deployments_app
+    ON deployments(coolify_app_uuid);
 """
 
 _db_path: Path | None = None
@@ -153,3 +173,108 @@ def delete_agent_state(conversation_uuid: str) -> None:
             "DELETE FROM agent_state WHERE conversation_uuid = ?",
             (conversation_uuid,),
         )
+
+
+# --- Deployments ---
+
+def count_repos_for_conv(conversation_uuid: str) -> int:
+    with connect() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM deployments "
+            "WHERE conversation_uuid = ? AND github_repo_name IS NOT NULL "
+            "AND status != 'destroyed'",
+            (conversation_uuid,),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def create_deployment(conversation_uuid: str, **fields) -> int:
+    cols = ["conversation_uuid", "status", "created_at", "updated_at"]
+    vals = [conversation_uuid, fields.get("status", "pending"), _now(), _now()]
+    for k in ("github_repo_name", "github_repo_url", "coolify_app_uuid",
+              "preview_url", "last_error"):
+        if k in fields:
+            cols.append(k)
+            vals.append(fields[k])
+    with connect() as c:
+        cur = c.execute(
+            f"INSERT INTO deployments ({', '.join(cols)}) "
+            f"VALUES ({', '.join(['?'] * len(vals))})",
+            tuple(vals),
+        )
+        return cur.lastrowid
+
+
+def update_active_deployment(conversation_uuid: str, **fields) -> None:
+    """Actualiza el ultimo deployment activo de la conversacion, o crea uno si no existe."""
+    if not fields:
+        return
+    with connect() as c:
+        row = c.execute(
+            "SELECT id FROM deployments WHERE conversation_uuid = ? "
+            "AND status != 'destroyed' ORDER BY id DESC LIMIT 1",
+            (conversation_uuid,),
+        ).fetchone()
+        if row:
+            set_parts = ", ".join(f"{k} = ?" for k in fields)
+            vals = list(fields.values()) + [_now(), row["id"]]
+            c.execute(
+                f"UPDATE deployments SET {set_parts}, updated_at = ? WHERE id = ?",
+                tuple(vals),
+            )
+        else:
+            create_deployment(conversation_uuid, **fields)
+
+
+def get_active_deployment(conversation_uuid: str) -> dict | None:
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM deployments WHERE conversation_uuid = ? "
+            "AND status != 'destroyed' ORDER BY id DESC LIMIT 1",
+            (conversation_uuid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_deployments_by_conv(conversation_uuid: str) -> list[dict]:
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM deployments WHERE conversation_uuid = ? ORDER BY id DESC",
+            (conversation_uuid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def handle_deploy_event(event: str, payload: dict):
+    """Callback que pasamos al modulo papolo.deploy. Persiste eventos en SQLite.
+
+    Eventos esperados:
+      - count_repos -> int
+      - repo_created, app_created, deploy_triggered, repo_deleted, app_destroyed
+    """
+    conv = payload.get("conversation_uuid")
+    if event == "count_repos" and conv:
+        return count_repos_for_conv(conv)
+    if not conv:
+        return None
+    if event == "repo_created":
+        create_deployment(
+            conv,
+            status="pending",
+            github_repo_name=payload.get("github_repo_name"),
+            github_repo_url=payload.get("github_repo_url"),
+        )
+    elif event == "app_created":
+        update_active_deployment(
+            conv,
+            status="building",
+            coolify_app_uuid=payload.get("coolify_app_uuid"),
+            preview_url=payload.get("preview_url"),
+        )
+    elif event == "deploy_triggered":
+        update_active_deployment(conv, status="building")
+    elif event == "repo_deleted":
+        update_active_deployment(conv, status="destroyed")
+    elif event == "app_destroyed":
+        update_active_deployment(conv, status="destroyed")
+    return None

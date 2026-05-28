@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+import subprocess
+import tempfile
 import uuid as uuid_lib
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -11,8 +14,8 @@ from papolo import Agent
 from papolo.skills import list_skills
 from papolo.subagents import list_subagents
 
-from . import db
-from .conversations import get_or_create_agent, persist_agent
+from . import confirmations, conversations, db
+from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
 from .discord_helpers import fetch_reply_context, format_user_turn, send_long
 
 log = logging.getLogger("papolo-bot")
@@ -26,6 +29,7 @@ def setup(bot: commands.Bot) -> None:
     @bot.event
     async def on_ready():
         log.info("Logueado como %s (id=%s)", bot.user, bot.user.id if bot.user else "?")
+        bind_bot(bot, asyncio.get_running_loop())
         guild_id = os.environ.get("DISCORD_GUILD_ID")
         try:
             if guild_id:
@@ -153,6 +157,153 @@ def setup(bot: commands.Bot) -> None:
             return
         body = "\n".join(f"- **{s['name']}**: {s['description']}" for s in subs)
         await interaction.response.send_message(body, ephemeral=True)
+
+    @bot.tree.command(
+        name="papolo-download",
+        description="Descarga el workspace del thread como zip",
+    )
+    async def papolo_download(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Usalo dentro de un thread de Papolo.", ephemeral=True
+            )
+            return
+        conv = db.get_conversation_by_thread(interaction.channel.id)
+        if not conv:
+            await interaction.response.send_message(
+                "Este thread no es de Papolo.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        ws = workspace_path(conv["uuid"])
+        if not ws.exists():
+            await interaction.followup.send("El workspace todavia no existe.")
+            return
+
+        short = conv["uuid"].split("-")[0]
+        out_path = Path(tempfile.gettempdir()) / f"papolo-{short}.zip"
+        try:
+            # git archive respeta .gitignore y es rapido. Fallback a zip si falla.
+            r = subprocess.run(
+                ["git", "archive", "HEAD", "--format=zip", "-o", str(out_path)],
+                cwd=ws, capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode != 0:
+                import shutil
+                stem = str(out_path.with_suffix(""))
+                shutil.make_archive(stem, "zip", ws)
+                out_path = Path(stem + ".zip")
+        except Exception as e:
+            await interaction.followup.send(f"Fallo armando el zip: {e}")
+            return
+
+        size_mb = out_path.stat().st_size / (1024 * 1024)
+        limit_mb = 24.5  # Discord free server cap
+        if size_mb > limit_mb:
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+            dep = db.get_active_deployment(conv["uuid"])
+            extra = f"\nGitHub: {dep['github_repo_url']}" if dep and dep.get("github_repo_url") else ""
+            await interaction.followup.send(
+                f"Workspace pesa {size_mb:.1f}MB, supera el limite de Discord "
+                f"({limit_mb:.0f}MB). Borra node_modules/target/.venv del workspace "
+                f"o usa GitHub.{extra}"
+            )
+            return
+
+        try:
+            await interaction.followup.send(
+                content=f"Workspace ({size_mb:.1f}MB):",
+                file=discord.File(str(out_path), filename=f"papolo-{short}.zip"),
+            )
+        finally:
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+
+    @bot.tree.command(
+        name="papolo-status",
+        description="Muestra el estado del deployment del thread",
+    )
+    async def papolo_status(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Usalo dentro de un thread de Papolo.", ephemeral=True
+            )
+            return
+        conv = db.get_conversation_by_thread(interaction.channel.id)
+        if not conv:
+            await interaction.response.send_message(
+                "Este thread no es de Papolo.", ephemeral=True
+            )
+            return
+        dep = db.get_active_deployment(conv["uuid"])
+        if not dep:
+            await interaction.response.send_message(
+                "No hay deployment activo en este thread.", ephemeral=True
+            )
+            return
+        body = (
+            f"**Status:** {dep['status']}\n"
+            f"**Repo:** {dep.get('github_repo_url') or '-'}\n"
+            f"**Preview:** {dep.get('preview_url') or '-'}\n"
+            f"**App UUID:** `{dep.get('coolify_app_uuid') or '-'}`\n"
+            f"**Ultimo error:** {dep.get('last_error') or '-'}"
+        )
+        await interaction.response.send_message(body)
+
+    @bot.tree.command(
+        name="papolo-destroy",
+        description="Destruye el deployment activo (repo + app Coolify)",
+    )
+    async def papolo_destroy(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Usalo dentro de un thread de Papolo.", ephemeral=True
+            )
+            return
+        conv = db.get_conversation_by_thread(interaction.channel.id)
+        if not conv:
+            await interaction.response.send_message(
+                "Este thread no es de Papolo.", ephemeral=True
+            )
+            return
+        dep = db.get_active_deployment(conv["uuid"])
+        if not dep:
+            await interaction.response.send_message(
+                "No hay deployment activo.", ephemeral=True
+            )
+            return
+
+        # Le pedimos al agente que se encargue (asi pasa por el flujo de confirmacion).
+        instruction = (
+            "El usuario pidio destruir el deployment activo. "
+        )
+        if dep.get("coolify_app_uuid"):
+            instruction += (
+                f"Llama coolify_destroy_app(app_uuid='{dep['coolify_app_uuid']}', confirm_token='ASK'). "
+            )
+        if dep.get("github_repo_name"):
+            instruction += (
+                f"Llama github_delete_repo(repo_name='{dep['github_repo_name']}', confirm_token='ASK'). "
+            )
+        instruction += "Una vez confirmado por el usuario, reintenta con el codigo dado."
+
+        await interaction.response.defer(thinking=True)
+        agent = get_or_create_agent(conv["uuid"])
+        try:
+            result = await _run_agent_turn(agent, instruction)
+        except Exception as e:
+            log.exception("destroy error")
+            await interaction.followup.send(f"ERROR: {e}")
+            return
+        persist_agent(conv["uuid"], agent)
+        await send_long(interaction.channel, result)
+        await interaction.followup.send("Listo.")
 
     @bot.event
     async def on_message(message: discord.Message):
