@@ -1,3 +1,4 @@
 [submodule "vendor/papolo"]
 	path = vendor/papolo
 	url = https://github.com/alexioficial/papolo
+	branch = main
