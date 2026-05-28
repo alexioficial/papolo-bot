@@ -16,7 +16,7 @@ from papolo.subagents import list_subagents
 
 from . import confirmations, conversations, db
 from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
-from .discord_helpers import fetch_reply_context, format_user_turn, send_long
+from .discord_helpers import fetch_reply_context, format_user_turn, send_ephemeral_long, send_long
 
 log = logging.getLogger("papolo-bot")
 
@@ -142,21 +142,23 @@ def setup(bot: commands.Bot) -> None:
 
     @bot.tree.command(name="papolo-skills", description="Lista las skills disponibles")
     async def papolo_skills(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         skills = list_skills()
         if not skills:
-            await interaction.response.send_message("(sin skills instaladas)", ephemeral=True)
+            await interaction.followup.send("(sin skills instaladas)", ephemeral=True)
             return
         body = "\n".join(f"- **{s['name']}**: {s['description']}" for s in skills)
-        await interaction.response.send_message(body, ephemeral=True)
+        await send_ephemeral_long(interaction, body)
 
     @bot.tree.command(name="papolo-subagents", description="Lista los subagentes disponibles")
     async def papolo_subs(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         subs = list_subagents()
         if not subs:
-            await interaction.response.send_message("(sin subagentes definidos)", ephemeral=True)
+            await interaction.followup.send("(sin subagentes definidos)", ephemeral=True)
             return
         body = "\n".join(f"- **{s['name']}**: {s['description']}" for s in subs)
-        await interaction.response.send_message(body, ephemeral=True)
+        await send_ephemeral_long(interaction, body)
 
     @bot.tree.command(
         name="papolo-download",

@@ -18,6 +18,30 @@ async def send_long(channel, text: str) -> None:
         await channel.send(c)
 
 
+def chunk_lines(lines: list[str], size: int = MAX_DISCORD_LEN) -> list[str]:
+    """Une lineas en bloques <= size sin partir lineas a la mitad."""
+    out: list[str] = []
+    cur = ""
+    for line in lines:
+        if not cur:
+            cur = line
+        elif len(cur) + 1 + len(line) <= size:
+            cur += "\n" + line
+        else:
+            out.append(cur)
+            cur = line
+    if cur:
+        out.append(cur)
+    return out
+
+
+async def send_ephemeral_long(interaction, text: str) -> None:
+    """Manda texto largo como ephemeral. Asume que interaction ya fue defer'd."""
+    parts = chunk_lines(text.split("\n")) or ["(vacio)"]
+    for p in parts:
+        await interaction.followup.send(p, ephemeral=True)
+
+
 async def fetch_reply_context(message: discord.Message) -> str | None:
     ref = message.reference
     if not ref or not ref.message_id:
