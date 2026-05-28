@@ -160,8 +160,6 @@ venv.bak/
 # Papolo runtime data
 data/
 
-# Local vendor copy of papolo (reemplazar por git submodule antes de push a deploy)
-vendor/
 
 # Spyder project settings
 .spyderproject
