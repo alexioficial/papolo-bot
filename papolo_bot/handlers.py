@@ -22,6 +22,82 @@ from .live_status import LiveStatus
 log = logging.getLogger("papolo-bot")
 
 
+def _build_transcript_md(conv: dict) -> str:
+    """Construye el .md con la conversacion Discord + el estado interno del agente."""
+    import json as _json
+    short = conv["uuid"].split("-")[0]
+    out: list[str] = []
+    out.append(f"# Transcripcion · papolo · {short}")
+    out.append("")
+    out.append(f"- UUID: `{conv['uuid']}`")
+    out.append(f"- Thread ID: `{conv['thread_id']}`")
+    out.append(f"- Creado: {conv['created_at']}")
+    out.append("")
+    out.append("---")
+    out.append("")
+    out.append("## Conversacion (lado Discord)")
+    out.append("")
+
+    msgs = db.get_messages(conv["uuid"])
+    for m in msgs:
+        author = m.get("author_name") or m["role"]
+        role = m["role"]
+        ts = m["created_at"]
+        icon = "🧑" if role == "user" else ("🤖" if role == "assistant" else "•")
+        out.append(f"### {icon} {author} ({role}) — {ts}")
+        out.append("")
+        content = (m.get("content") or "").strip()
+        if not content:
+            out.append("_(vacio)_")
+        else:
+            out.append(content)
+        out.append("")
+
+    out.append("---")
+    out.append("")
+    out.append("## Estado interno del agente (mensajes openai-style con tool calls/results)")
+    out.append("")
+
+    state = db.load_agent_state(conv["uuid"]) or []
+    for i, msg in enumerate(state):
+        role = msg.get("role", "?")
+        out.append(f"### [{i}] {role}")
+        out.append("")
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            preview = content if len(content) <= 6000 else (content[:6000] + f"\n…[truncated {len(content)-6000} chars]")
+            out.append("```")
+            out.append(preview)
+            out.append("```")
+            out.append("")
+
+        tool_calls = msg.get("tool_calls") or []
+        for tc in tool_calls:
+            fn = (tc.get("function") or {})
+            tname = fn.get("name", "?")
+            targs = fn.get("arguments", "")
+            try:
+                parsed = _json.loads(targs) if isinstance(targs, str) else targs
+                targs_pretty = _json.dumps(parsed, indent=2, ensure_ascii=False)
+            except Exception:
+                targs_pretty = str(targs)
+            if len(targs_pretty) > 4000:
+                targs_pretty = targs_pretty[:4000] + f"\n…[truncated {len(targs_pretty)-4000} chars]"
+            out.append(f"**tool_call:** `{tname}` (id: `{tc.get('id','?')}`)")
+            out.append("```json")
+            out.append(targs_pretty)
+            out.append("```")
+            out.append("")
+
+        if role == "tool":
+            tcid = msg.get("tool_call_id", "?")
+            tname = msg.get("name", "?")
+            out.append(f"**tool result** for `{tname}` (call_id: `{tcid}`)")
+            out.append("")
+
+    return "\n".join(out)
+
+
 async def _run_agent_turn(agent: Agent, prompt: str,
                            channel: discord.abc.Messageable | None = None) -> str:
     if channel is None:
@@ -232,6 +308,45 @@ def setup(bot: commands.Bot) -> None:
             await interaction.followup.send(
                 content=f"Workspace ({size_mb:.1f}MB):",
                 file=discord.File(str(out_path), filename=f"papolo-{short}.zip"),
+            )
+        finally:
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+
+    @bot.tree.command(
+        name="papolo-transcript",
+        description="Exporta la conversacion + estado interno del agente como .md",
+    )
+    async def papolo_transcript(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Usalo dentro de un thread de Papolo.", ephemeral=True
+            )
+            return
+        conv = db.get_conversation_by_thread(interaction.channel.id)
+        if not conv:
+            await interaction.response.send_message(
+                "Este thread no es de Papolo.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        short = conv["uuid"].split("-")[0]
+        md = _build_transcript_md(conv)
+        out_path = Path(tempfile.gettempdir()) / f"papolo-{short}-transcript.md"
+        out_path.write_text(md, encoding="utf-8")
+        try:
+            size_mb = out_path.stat().st_size / (1024 * 1024)
+            if size_mb > 24.5:
+                await interaction.followup.send(
+                    f"Transcripcion supera el limite de Discord ({size_mb:.1f}MB)."
+                )
+                return
+            await interaction.followup.send(
+                content=f"Transcripcion ({size_mb:.2f}MB, {len(md):,} chars):",
+                file=discord.File(str(out_path), filename=f"papolo-{short}-transcript.md"),
             )
         finally:
             try:

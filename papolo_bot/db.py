@@ -144,6 +144,16 @@ def save_message(
         )
 
 
+def get_messages(conversation_uuid: str) -> list[dict]:
+    """Mensajes del lado Discord (los visibles al usuario)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM messages WHERE conversation_uuid = ? ORDER BY id ASC",
+            (conversation_uuid,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def load_agent_state(conversation_uuid: str) -> list[dict] | None:
     with connect() as c:
         row = c.execute(
