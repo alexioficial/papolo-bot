@@ -107,7 +107,15 @@ class LiveStatus:
             self._dirty = True
             asyncio.run_coroutine_threadsafe(self._do_edit(), self.loop)
 
-    def _update_state(self, kind: str, payload: dict) -> None:
+    def _update_state(self, kind: str, payload) -> None:
+        if kind == "final":
+            text = payload.get("content", "") if isinstance(payload, dict) else str(payload)
+            self.final_preview = (text or "")[:200]
+            return
+
+        if not isinstance(payload, dict):
+            return
+
         name = payload.get("name", "")
         subagent = payload.get("subagent")
         depth = payload.get("depth")
@@ -144,9 +152,7 @@ class LiveStatus:
             self.subagents_active.pop(sub_name, None)
             self.subagents_done.add(sub_name)
             self._push_event(f"✅ subagent `{sub_name}` done")
-        elif kind == "final":
-            text = str(payload) if not isinstance(payload, str) else payload
-            self.final_preview = text[:200]
+        # 'final' ya manejado arriba
 
     def _push_event(self, line: str) -> None:
         self.last_events.append(line)
