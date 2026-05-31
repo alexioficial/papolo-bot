@@ -17,12 +17,24 @@ from papolo.subagents import list_subagents
 from . import confirmations, conversations, db
 from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
 from .discord_helpers import fetch_reply_context, format_user_turn, send_ephemeral_long, send_long
+from .live_status import LiveStatus
 
 log = logging.getLogger("papolo-bot")
 
 
-async def _run_agent_turn(agent: Agent, prompt: str) -> str:
-    return await asyncio.to_thread(agent.send, prompt)
+async def _run_agent_turn(agent: Agent, prompt: str,
+                           channel: discord.abc.Messageable | None = None) -> str:
+    if channel is None:
+        return await asyncio.to_thread(agent.send, prompt)
+    loop = asyncio.get_running_loop()
+    live = LiveStatus(channel=channel, loop=loop)
+    try:
+        result = await asyncio.to_thread(agent.send, prompt, live.on_event)
+    except Exception:
+        await live.finalize("error")
+        raise
+    await live.finalize("done")
+    return result
 
 
 def setup(bot: commands.Bot) -> None:
@@ -96,7 +108,7 @@ def setup(bot: commands.Bot) -> None:
 
         agent = get_or_create_agent(conv_uuid)
         try:
-            result = await _run_agent_turn(agent, formatted)
+            result = await _run_agent_turn(agent, formatted, channel=thread)
         except Exception as e:
             log.exception("Agent error en /papolo")
             await thread.send(f"ERROR: {e}")
@@ -298,7 +310,7 @@ def setup(bot: commands.Bot) -> None:
         await interaction.response.defer(thinking=True)
         agent = get_or_create_agent(conv["uuid"])
         try:
-            result = await _run_agent_turn(agent, instruction)
+            result = await _run_agent_turn(agent, instruction, channel=interaction.channel)
         except Exception as e:
             log.exception("destroy error")
             await interaction.followup.send(f"ERROR: {e}")
@@ -339,7 +351,7 @@ def setup(bot: commands.Bot) -> None:
         agent = get_or_create_agent(conv_uuid)
         async with message.channel.typing():
             try:
-                result = await _run_agent_turn(agent, formatted)
+                result = await _run_agent_turn(agent, formatted, channel=message.channel)
             except Exception as e:
                 log.exception("Agent error en thread")
                 await message.channel.send(f"ERROR: {e}")
