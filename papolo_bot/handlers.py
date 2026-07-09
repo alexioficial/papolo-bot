@@ -14,7 +14,7 @@ from papolo import Agent
 from papolo.skills import list_skills
 from papolo.subagents import list_subagents
 
-from . import confirmations, conversations, db
+from . import active_turns, confirmations, conversations, db
 from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
 from .discord_helpers import fetch_reply_context, format_user_turn, send_ephemeral_long, send_long
 from .live_status import LiveStatus
@@ -107,18 +107,26 @@ def _build_transcript_md(conv: dict) -> str:
 
 
 async def _run_agent_turn(agent: Agent, prompt: str,
-                           channel: discord.abc.Messageable | None = None) -> str:
-    if channel is None:
-        return await asyncio.to_thread(agent.send, prompt)
-    loop = asyncio.get_running_loop()
-    live = LiveStatus(channel=channel, loop=loop)
+                           channel: discord.abc.Messageable | None = None,
+                           conv_uuid: str | None = None) -> str:
+    # Registrar el turno para que /papolo-stop pueda cancelarlo mientras corre.
+    if conv_uuid:
+        active_turns.register(conv_uuid, agent)
     try:
-        result = await asyncio.to_thread(agent.send, prompt, live.on_event)
-    except Exception:
-        await live.finalize("error")
-        raise
-    await live.finalize("done")
-    return result
+        if channel is None:
+            return await asyncio.to_thread(agent.send, prompt)
+        loop = asyncio.get_running_loop()
+        live = LiveStatus(channel=channel, loop=loop)
+        try:
+            result = await asyncio.to_thread(agent.send, prompt, live.on_event)
+        except Exception:
+            await live.finalize("error")
+            raise
+        await live.finalize("done")
+        return result
+    finally:
+        if conv_uuid:
+            active_turns.unregister(conv_uuid)
 
 
 def setup(bot: commands.Bot) -> None:
@@ -192,7 +200,7 @@ def setup(bot: commands.Bot) -> None:
 
         agent = get_or_create_agent(conv_uuid)
         try:
-            result = await _run_agent_turn(agent, formatted, channel=thread)
+            result = await _run_agent_turn(agent, formatted, channel=thread, conv_uuid=conv_uuid)
         except Exception as e:
             log.exception("Agent error en /papolo")
             await thread.send(f"ERROR: {e}")
@@ -220,6 +228,34 @@ def setup(bot: commands.Bot) -> None:
             return
         db.delete_agent_state(conv["uuid"])
         await interaction.response.send_message("Memoria del thread reseteada.")
+
+    @bot.tree.command(
+        name="papolo-stop",
+        description="Cancela el prompt que Papolo esta procesando ahora en este thread",
+    )
+    async def papolo_stop(interaction: discord.Interaction):
+        # Igual que el resto: solo dentro de un thread de Papolo; afuera tira error.
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "Usalo dentro de un thread de Papolo.", ephemeral=True
+            )
+            return
+        conv = db.get_conversation_by_thread(interaction.channel.id)
+        if not conv:
+            await interaction.response.send_message(
+                "Este thread no es de Papolo.", ephemeral=True
+            )
+            return
+        if active_turns.cancel(conv["uuid"]):
+            await interaction.response.send_message(
+                "Cancelando el prompt en curso… Papolo para en el proximo checkpoint "
+                "(no corta una tool que ya esta ejecutandose)."
+            )
+        else:
+            await interaction.response.send_message(
+                "No hay ningun prompt corriendo en este thread ahora mismo.",
+                ephemeral=True,
+            )
 
     @bot.tree.command(name="papolo-uuid", description="Muestra el UUID de esta conversacion")
     async def papolo_uuid(interaction: discord.Interaction):
@@ -433,7 +469,7 @@ def setup(bot: commands.Bot) -> None:
         await interaction.response.defer(thinking=True)
         agent = get_or_create_agent(conv["uuid"])
         try:
-            result = await _run_agent_turn(agent, instruction, channel=interaction.channel)
+            result = await _run_agent_turn(agent, instruction, channel=interaction.channel, conv_uuid=conv["uuid"])
         except Exception as e:
             log.exception("destroy error")
             await interaction.followup.send(f"ERROR: {e}")
@@ -474,7 +510,7 @@ def setup(bot: commands.Bot) -> None:
         agent = get_or_create_agent(conv_uuid)
         async with message.channel.typing():
             try:
-                result = await _run_agent_turn(agent, formatted, channel=message.channel)
+                result = await _run_agent_turn(agent, formatted, channel=message.channel, conv_uuid=conv_uuid)
             except Exception as e:
                 log.exception("Agent error en thread")
                 await message.channel.send(f"ERROR: {e}")

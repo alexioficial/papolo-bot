@@ -16,6 +16,7 @@ Bot de Discord que expone el agente Papolo. Cada conversacion vive en un **threa
 |---|---|---|
 | `/papolo <prompt>` | canal | crea thread y arranca conversacion |
 | `/papolo-reset` | thread | limpia memoria del agente (no borra historial) |
+| `/papolo-stop` | thread | cancela el prompt que Papolo esta procesando ahora (corta en el proximo checkpoint) |
 | `/papolo-uuid` | thread | postea el UUID de la conversacion |
 | `/papolo-skills` | cualquiera | lista skills disponibles |
 | `/papolo-subagents` | cualquiera | lista subagentes disponibles |
