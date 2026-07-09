@@ -5,7 +5,6 @@ Independiente de Discord — solo guarda codigos. La logica de postear al thread
 y matchear respuestas del usuario vive en conversations.py / handlers.py.
 """
 
-import re
 import secrets
 import threading
 import time
@@ -49,22 +48,3 @@ def consume(conv_uuid: str, action: str, target: str, token: str) -> bool:
             return False
         _pending.pop(key, None)
         return True
-
-
-def find_action_by_code(conv_uuid: str, code: str) -> tuple[str, str] | None:
-    """Para el parser del bot: dado un codigo del usuario, encontrar (action, target)."""
-    with _lock:
-        _purge_locked()
-        for (cu, action, target), (c, exp) in _pending.items():
-            if cu == conv_uuid and c == code and exp >= _now():
-                return (action, target)
-    return None
-
-
-_CONFIRM_RE = re.compile(r"\bconfirmar\s+([a-f0-9]{6})\b", re.IGNORECASE)
-
-
-def parse_user_message(text: str) -> str | None:
-    """Si el mensaje del usuario contiene 'confirmar <code>', devuelve el code."""
-    m = _CONFIRM_RE.search(text or "")
-    return m.group(1).lower() if m else None

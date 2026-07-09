@@ -59,6 +59,14 @@ def _build_transcript_md(conv: dict) -> str:
     out.append("")
 
     state = db.load_agent_state(conv["uuid"]) or []
+    # Los tool-result messages se guardan sin 'name'; mapeamos tool_call_id -> name
+    # desde los tool_calls de los mensajes assistant para poder rotularlos.
+    id_to_name: dict[str, str] = {}
+    for msg in state:
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            if tc.get("id"):
+                id_to_name[tc["id"]] = fn.get("name", "?")
     for i, msg in enumerate(state):
         role = msg.get("role", "?")
         out.append(f"### [{i}] {role}")
@@ -91,7 +99,7 @@ def _build_transcript_md(conv: dict) -> str:
 
         if role == "tool":
             tcid = msg.get("tool_call_id", "?")
-            tname = msg.get("name", "?")
+            tname = id_to_name.get(tcid, msg.get("name", "?"))
             out.append(f"**tool result** for `{tname}` (call_id: `{tcid}`)")
             out.append("")
 
