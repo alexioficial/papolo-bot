@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import uuid as uuid_lib
 from pathlib import Path
+from typing import Literal
 
 import discord
 from discord import app_commands
@@ -309,27 +310,32 @@ def setup(bot: commands.Bot) -> None:
 
     @bot.tree.command(
         name="papolo-model",
-        description="Muestra o cambia el modelo de DeepSeek que usa Papolo",
+        description="Muestra o cambia el modelo de DeepSeek (orquestador o subagentes)",
     )
     @app_commands.describe(
-        model="Modelo a usar (autocompleta con los disponibles). Vacio = muestra el actual."
+        model="Modelo a usar (autocompleta con los disponibles). Vacio = muestra los actuales.",
+        scope="A que capa aplica el cambio (default: orquestador).",
     )
     @app_commands.autocomplete(model=_model_autocomplete)
-    async def papolo_model(interaction: discord.Interaction, model: str | None = None):
+    async def papolo_model(
+        interaction: discord.Interaction,
+        model: str | None = None,
+        scope: Literal["orquestador", "subagentes"] = "orquestador",
+    ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         avail = await asyncio.to_thread(models.available_models)
 
-        # Sin argumento: mostrar el modelo actual + los disponibles.
+        # Sin argumento: mostrar ambos modelos actuales + los disponibles.
         if not model:
-            cur = models.current_model()
-            listado = "\n".join(
-                f"- `{m}`" + ("  ← actual" if m == cur else "") for m in avail
-            )
-            if cur not in avail:
-                listado = f"- `{cur}`  ← actual (no listado por la API)\n" + listado
+            cur_main = models.current_model()
+            cur_sub = models.current_subagent_model()
+            listado = "\n".join(f"- `{m}`" for m in avail)
             await interaction.followup.send(
-                f"**Modelo actual:** `{cur}`\n\n**Disponibles:**\n{listado}\n\n"
-                f"Para cambiarlo: `/papolo-model model:<nombre>`.",
+                f"**Orquestador (agente principal):** `{cur_main}`\n"
+                f"**Subagentes:** `{cur_sub}`\n\n"
+                f"**Disponibles:**\n{listado}\n\n"
+                f"Cambiar: `/papolo-model model:<nombre>` (orquestador) · "
+                f"`/papolo-model model:<nombre> scope:subagentes`.",
                 ephemeral=True,
             )
             return
@@ -346,9 +352,14 @@ def setup(bot: commands.Bot) -> None:
             )
             return
 
-        models.set_model(model)
+        if scope == "subagentes":
+            models.set_subagent_model(model)
+            capa = "de los subagentes"
+        else:
+            models.set_model(model)
+            capa = "del orquestador"
         await interaction.followup.send(
-            f"Modelo de Papolo actualizado a `{model}`. "
+            f"Modelo {capa} actualizado a `{model}`. "
             f"Aplica desde el proximo turno en todos los threads.",
             ephemeral=True,
         )

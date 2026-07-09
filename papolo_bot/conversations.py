@@ -8,7 +8,7 @@ from papolo import Agent
 from papolo import deploy as papolo_deploy
 
 from . import confirmations, db
-from .models import current_model
+from .models import current_model, current_subagent_model
 
 log = logging.getLogger("papolo-bot")
 
@@ -72,6 +72,7 @@ def get_or_create_agent(conversation_uuid: str) -> Agent:
         workspace_dir=workspace_dir,
         conversation_uuid=conversation_uuid,
         model=current_model(),
+        subagent_model=current_subagent_model(),
     )
     if saved:
         kwargs["messages"] = saved

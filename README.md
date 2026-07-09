@@ -20,7 +20,7 @@ Bot de Discord que expone el agente Papolo. Cada conversacion vive en un **threa
 | `/papolo-uuid` | thread | postea el UUID de la conversacion |
 | `/papolo-skills` | cualquiera | lista skills disponibles |
 | `/papolo-subagents` | cualquiera | lista subagentes disponibles |
-| `/papolo-model [model]` | cualquiera | muestra o cambia el modelo de DeepSeek (autocompleta con los disponibles); se guarda en SQLite y aplica a todos los threads |
+| `/papolo-model [model] [scope]` | cualquiera | muestra o cambia el modelo de DeepSeek (autocompleta con los disponibles). `scope:orquestador` (default) = agente principal; `scope:subagentes` = subagentes (default `deepseek-chat`). Se guarda en SQLite y aplica a todos los threads |
 
 ## Setup local
 

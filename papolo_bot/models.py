@@ -20,7 +20,12 @@ log = logging.getLogger("papolo-bot")
 # Fallback cuando la API no responde: los modelos publicos de DeepSeek.
 KNOWN_MODELS = ["deepseek-chat", "deepseek-reasoner"]
 
-MODEL_SETTING_KEY = "model"
+MODEL_SETTING_KEY = "model"              # modelo del orquestador (agente principal)
+SUBAGENT_MODEL_SETTING_KEY = "subagent_model"  # modelo de los subagentes
+# Por defecto los subagentes corren en flash (barato/rapido): son tareas angostas y
+# el scaffolding de REASONING_PROTOCOL los hace rendir como senior. Se cambia con
+# /papolo-model scope:subagentes.
+DEFAULT_SUBAGENT_MODEL = "deepseek-chat"
 
 _CACHE_TTL = 600.0  # 10 min
 _cache: list[str] = []
@@ -53,9 +58,18 @@ def available_models(force: bool = False) -> list[str]:
 
 
 def current_model() -> str:
-    """El modelo activo: override persistido en DB, o el default del env del motor."""
+    """Modelo del orquestador: override persistido en DB, o el default del env del motor."""
     return db.get_setting(MODEL_SETTING_KEY) or model_name()
 
 
 def set_model(model: str) -> None:
     db.set_setting(MODEL_SETTING_KEY, model)
+
+
+def current_subagent_model() -> str:
+    """Modelo de los subagentes: override persistido en DB, o flash por defecto."""
+    return db.get_setting(SUBAGENT_MODEL_SETTING_KEY) or DEFAULT_SUBAGENT_MODEL
+
+
+def set_subagent_model(model: str) -> None:
+    db.set_setting(SUBAGENT_MODEL_SETTING_KEY, model)
