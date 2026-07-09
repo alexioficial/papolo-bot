@@ -14,7 +14,7 @@ from papolo import Agent
 from papolo.skills import list_skills
 from papolo.subagents import list_subagents
 
-from . import active_turns, confirmations, conversations, db
+from . import active_turns, confirmations, conversations, db, models
 from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
 from .discord_helpers import fetch_reply_context, format_user_turn, send_ephemeral_long, send_long
 from .live_status import LiveStatus
@@ -127,6 +127,21 @@ async def _run_agent_turn(agent: Agent, prompt: str,
     finally:
         if conv_uuid:
             active_turns.unregister(conv_uuid)
+
+
+async def _model_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Sugiere los modelos de DeepSeek disponibles mientras el usuario escribe.
+    available_models() cachea, asi que salvo el primer fetch responde al instante;
+    igual lo corremos en un thread con timeout para no colgar el callback (~3s de budget)."""
+    try:
+        avail = await asyncio.wait_for(asyncio.to_thread(models.available_models), timeout=2.5)
+    except Exception:
+        avail = models.KNOWN_MODELS
+    cur = (current or "").lower()
+    matches = [m for m in avail if cur in m.lower()] or avail
+    return [app_commands.Choice(name=m, value=m) for m in matches[:25]]
 
 
 def setup(bot: commands.Bot) -> None:
@@ -291,6 +306,52 @@ def setup(bot: commands.Bot) -> None:
             return
         body = "\n".join(f"- **{s['name']}**: {s['description']}" for s in subs)
         await send_ephemeral_long(interaction, body)
+
+    @bot.tree.command(
+        name="papolo-model",
+        description="Muestra o cambia el modelo de DeepSeek que usa Papolo",
+    )
+    @app_commands.describe(
+        model="Modelo a usar (autocompleta con los disponibles). Vacio = muestra el actual."
+    )
+    @app_commands.autocomplete(model=_model_autocomplete)
+    async def papolo_model(interaction: discord.Interaction, model: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        avail = await asyncio.to_thread(models.available_models)
+
+        # Sin argumento: mostrar el modelo actual + los disponibles.
+        if not model:
+            cur = models.current_model()
+            listado = "\n".join(
+                f"- `{m}`" + ("  ← actual" if m == cur else "") for m in avail
+            )
+            if cur not in avail:
+                listado = f"- `{cur}`  ← actual (no listado por la API)\n" + listado
+            await interaction.followup.send(
+                f"**Modelo actual:** `{cur}`\n\n**Disponibles:**\n{listado}\n\n"
+                f"Para cambiarlo: `/papolo-model model:<nombre>`.",
+                ephemeral=True,
+            )
+            return
+
+        model = model.strip()
+        # Validar contra los disponibles (si pudimos listarlos). El fallback ya
+        # incluye los modelos publicos, asi que uno valido no queda bloqueado.
+        if avail and model not in avail:
+            opts = ", ".join(f"`{m}`" for m in avail)
+            await interaction.followup.send(
+                f"`{model}` no esta entre los modelos disponibles ({opts}). "
+                f"Elegi uno de la lista.",
+                ephemeral=True,
+            )
+            return
+
+        models.set_model(model)
+        await interaction.followup.send(
+            f"Modelo de Papolo actualizado a `{model}`. "
+            f"Aplica desde el proximo turno en todos los threads.",
+            ephemeral=True,
+        )
 
     @bot.tree.command(
         name="papolo-download",

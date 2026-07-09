@@ -57,6 +57,12 @@ CREATE INDEX IF NOT EXISTS idx_deployments_conv
 
 CREATE INDEX IF NOT EXISTS idx_deployments_app
     ON deployments(coolify_app_uuid);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _db_path: Path | None = None
@@ -187,6 +193,26 @@ def delete_agent_state(conversation_uuid: str) -> None:
         c.execute(
             "DELETE FROM agent_state WHERE conversation_uuid = ?",
             (conversation_uuid,),
+        )
+
+
+# --- Settings (key-value global del bot) ---
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with connect() as c:
+        row = c.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with connect() as c:
+        c.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value = excluded.value, updated_at = excluded.updated_at",
+            (key, value, _now()),
         )
 
 

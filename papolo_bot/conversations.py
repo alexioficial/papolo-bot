@@ -8,6 +8,7 @@ from papolo import Agent
 from papolo import deploy as papolo_deploy
 
 from . import confirmations, db
+from .models import current_model
 
 log = logging.getLogger("papolo-bot")
 
@@ -65,16 +66,16 @@ def _ensure_workspace(conversation_uuid: str) -> str:
 def get_or_create_agent(conversation_uuid: str) -> Agent:
     workspace_dir = _ensure_workspace(conversation_uuid)
     saved = db.load_agent_state(conversation_uuid)
-    if saved:
-        return Agent(
-            messages=saved,
-            workspace_dir=workspace_dir,
-            conversation_uuid=conversation_uuid,
-        )
-    return Agent(
+    # El modelo se resuelve fresco en cada turno (el bot crea un Agent nuevo por turno),
+    # asi que cambiarlo con /papolo-model aplica en el proximo mensaje de cualquier thread.
+    kwargs = dict(
         workspace_dir=workspace_dir,
         conversation_uuid=conversation_uuid,
+        model=current_model(),
     )
+    if saved:
+        kwargs["messages"] = saved
+    return Agent(**kwargs)
 
 
 def persist_agent(conversation_uuid: str, agent: Agent) -> None:

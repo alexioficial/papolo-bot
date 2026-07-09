@@ -20,6 +20,7 @@ Bot de Discord que expone el agente Papolo. Cada conversacion vive en un **threa
 | `/papolo-uuid` | thread | postea el UUID de la conversacion |
 | `/papolo-skills` | cualquiera | lista skills disponibles |
 | `/papolo-subagents` | cualquiera | lista subagentes disponibles |
+| `/papolo-model [model]` | cualquiera | muestra o cambia el modelo de DeepSeek (autocompleta con los disponibles); se guarda en SQLite y aplica a todos los threads |
 
 ## Setup local
 
@@ -97,8 +98,9 @@ El volumen `papolo_data` persiste el SQLite entre redeploys.
 papolo-bot/
 ├── bot.py                     # arranque
 ├── papolo_bot/
-│   ├── db.py                  # SQLite (schema + queries)
+│   ├── db.py                  # SQLite (schema + queries + settings)
 │   ├── conversations.py       # bridge agente <-> sqlite
+│   ├── models.py              # modelos DeepSeek disponibles + modelo configurado
 │   ├── discord_helpers.py     # chunks, formateo, fetch reply
 │   └── handlers.py            # slash commands + on_message
 ├── vendor/papolo/             # submodule del motor (en deploy)
