@@ -10,6 +10,11 @@ Anti-rate-limit: un unico render loop hace COMO MUCHO una accion de Discord por 
 se editan todos a la vez; se cicla. Se priorizan (1) crear paneles nuevos y (2) mostrar
 los que recien terminaron; el resto de las actualizaciones ciclan.
 
+Cuando un subagente termina (Done/Error) y su embed ya reflejo ese estado terminal, el
+panel se "retira": queda congelado en pantalla y sale del ciclo de updates (no vuelve a
+editarse, ni en el round-robin ni en el flush final), liberando ticks para lo que sigue
+activo.
+
 Uso:
     live = LiveStatus(channel=thread, loop=loop)
     live.start()
@@ -92,6 +97,7 @@ class _Panel:
         self.wants_message = False    # hay que crear su mensaje
         self.dirty = False            # cambio el estado desde el ultimo edit
         self.final_pending = False    # transiciono a done/error y falta reflejarlo
+        self.retired = False          # subagente terminal ya renderizado: fuera del ciclo
         self.state = "working"        # working | done | error
         self.events: list[str] = []
         self.tools_called: Counter = Counter()
@@ -256,16 +262,18 @@ class LiveStatus:
             units = [self.main] + [self.panels[k] for k in self.panel_order]
             # 1. crear mensajes pendientes (paneles nuevos aparecen ~1/tick)
             for u in units:
-                if u.message is None and u.wants_message:
+                if u.message is None and u.wants_message and not u.retired:
                     return ("create", u)
             # 2. reflejar transiciones a done/error cuanto antes
             for u in units:
-                if u.message is not None and u.final_pending:
+                if u.message is not None and u.final_pending and not u.retired:
                     return ("edit", u)
-            # 3. ciclar los sucios
-            n = len(units)
+            # 3. ciclar los sucios — los subagentes ya retirados (Done/Error
+            #    renderizado) quedan fuera del round-robin.
+            active = [u for u in units if not u.retired]
+            n = len(active)
             for i in range(n):
-                u = units[(self._rr + i) % n]
+                u = active[(self._rr + i) % n]
                 if u.message is not None and u.dirty:
                     self._rr = (self._rr + i + 1) % n
                     return ("edit", u)
@@ -294,6 +302,12 @@ class LiveStatus:
             log.warning("live_status: edit fallo (%s)", e)
         except Exception:
             log.exception("live_status: edit excep")
+        else:
+            # Si el subagente ya mostro su estado terminal, sacarlo del ciclo:
+            # su embed queda congelado en Done/Error y no se vuelve a tocar.
+            if u.kind == "subagent" and u.state in ("done", "error"):
+                with self._lock:
+                    u.retired = True
 
     # ── finalize: parar el loop y volcar todo al estado terminal ────────
 
@@ -309,7 +323,10 @@ class LiveStatus:
             self.main.final_pending = True
             self.main.dirty = True
             # Subagentes que quedaron 'working' (no emitieron end) se dan por terminados.
+            # Los ya retirados (Done/Error renderizado) no se vuelven a tocar.
             for p in self.panels.values():
+                if p.retired:
+                    continue
                 if p.state == "working":
                     p.state = "done"
                 p.final_pending = True
@@ -322,6 +339,8 @@ class LiveStatus:
             for u in units:
                 # discord.py maneja el 429 con backoff automatico, asi que este burst
                 # secuencial es seguro aunque haya varios paneles.
+                if u.retired:
+                    continue
                 if u.message is None and u.wants_message:
                     await self._create_message(u)
                 elif u.message is not None:
