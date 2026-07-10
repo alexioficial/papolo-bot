@@ -1,13 +1,23 @@
 """
-Live status embed que se actualiza en el thread mientras el agente corre.
+Live status en Discord mientras el agente corre.
+
+Un mensaje-embed principal (el turno completo) + un embed propio por cada subagente
+de nivel 1 que el orquestador spawnea (los que corren en paralelo). Cada panel muestra
+su actividad y, al terminar, se pone verde con "Done".
+
+Anti-rate-limit: un unico render loop hace COMO MUCHO una accion de Discord por tick
+(crear un mensaje o editar uno), en round-robin entre el principal y los paneles. Nunca
+se editan todos a la vez; se cicla. Se priorizan (1) crear paneles nuevos y (2) mostrar
+los que recien terminaron; el resto de las actualizaciones ciclan.
 
 Uso:
     live = LiveStatus(channel=thread, loop=loop)
+    live.start()
     result = await asyncio.to_thread(agent.send, prompt, live.on_event)
     await live.finalize("done")
 
-El on_event se llama desde threads worker (ThreadPoolExecutor del agente).
-Mutaciones de estado bajo lock, scheduling de edits via run_coroutine_threadsafe.
+on_event se llama desde threads worker (ThreadPoolExecutor del agente): solo muta estado
+bajo _lock. Todo el I/O de Discord ocurre en el event loop (render loop / finalize).
 """
 
 import asyncio
@@ -20,8 +30,9 @@ import discord
 
 log = logging.getLogger("papolo-bot")
 
-EDIT_THROTTLE_SECONDS = 1.0
+EDIT_THROTTLE_SECONDS = 1.0   # como mucho 1 accion de Discord por este intervalo
 MAX_LAST_EVENTS = 6
+MAX_PANELS = 8                # tope de embeds de subagente para no inundar el canal
 
 _TOOL_ICONS = {
     "read_file": "📖",
@@ -70,47 +81,81 @@ def _summarize_args(name: str, args: dict) -> str:
     return ""
 
 
+class _Panel:
+    """Un mensaje-embed: el principal o el de un subagente."""
+
+    def __init__(self, label: str, kind: str, start_time: float):
+        self.label = label            # "Papolo" o el nombre del subagente
+        self.kind = kind              # "main" | "subagent"
+        self.start_time = start_time
+        self.message: discord.Message | None = None
+        self.wants_message = False    # hay que crear su mensaje
+        self.dirty = False            # cambio el estado desde el ultimo edit
+        self.final_pending = False    # transiciono a done/error y falta reflejarlo
+        self.state = "working"        # working | done | error
+        self.events: list[str] = []
+        self.tools_called: Counter = Counter()
+        self.tools_finished: Counter = Counter()
+        self.errors = 0
+        self.final_preview = ""
+        self.task = ""
+
+    def push(self, line: str) -> None:
+        self.events.append(line)
+        if len(self.events) > MAX_LAST_EVENTS:
+            self.events = self.events[-MAX_LAST_EVENTS:]
+        self.dirty = True
+
+
 class LiveStatus:
     def __init__(self, channel: discord.abc.Messageable,
                  loop: asyncio.AbstractEventLoop):
         self.channel = channel
         self.loop = loop
-        self.message: discord.Message | None = None
 
-        self._lock = threading.Lock()
-        self._async_lock = asyncio.Lock()
-        self._dirty = False
-        self._last_edit = 0.0
-        self._creating = False
+        self._lock = threading.Lock()       # protege el estado mutado desde workers
+        self._io_lock = asyncio.Lock()      # serializa I/O de Discord (tick vs finalize)
+        self._task: asyncio.Task | None = None
+        self._rr = 0                        # cursor de round-robin
 
-        self.start_time = time.time()
-        self.tools_called: Counter = Counter()
-        self.tools_finished: Counter = Counter()
-        self.errors = 0
-        self.last_events: list[str] = []
+        now = time.time()
+        self.main = _Panel(label="Papolo", kind="main", start_time=now)
+        self.panels: dict[str, _Panel] = {}  # sub_id -> panel
+        self.panel_order: list[str] = []
+
+        # Roster compacto para el embed principal (solo display; puede juntar homonimos).
         self.subagents_active: dict[str, int] = {}
         self.subagents_done: set[str] = set()
-        self.final_preview: str = ""
 
-    # --- llamado desde threads worker ---
+    # ── arranque / parada ───────────────────────────────────────────────
 
-    def on_event(self, kind: str, payload: dict) -> None:
+    def start(self) -> None:
+        """Arranca el render loop. Llamar desde el event loop (handler async)."""
         with self._lock:
-            self._update_state(kind, payload)
-        if self.message is None:
-            if not self._creating:
-                self._creating = True
-                asyncio.run_coroutine_threadsafe(self._ensure_message(), self.loop)
-            return
-        now = time.time()
-        if now - self._last_edit >= EDIT_THROTTLE_SECONDS and not self._dirty:
-            self._dirty = True
-            asyncio.run_coroutine_threadsafe(self._do_edit(), self.loop)
+            self.main.wants_message = True
+        self._task = self.loop.create_task(self._render_loop())
 
-    def _update_state(self, kind: str, payload) -> None:
+    async def _render_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(EDIT_THROTTLE_SECONDS)
+                await self._tick()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("live_status: render loop murio")
+
+    # ── eventos (desde threads worker) ──────────────────────────────────
+
+    def on_event(self, kind: str, payload) -> None:
+        with self._lock:
+            self._update(kind, payload)
+
+    def _update(self, kind: str, payload) -> None:
         if kind == "final":
             text = payload.get("content", "") if isinstance(payload, dict) else str(payload)
-            self.final_preview = (text or "")[:200]
+            self.main.final_preview = (text or "")[:1000]
+            self.main.dirty = True
             return
 
         if not isinstance(payload, dict):
@@ -118,46 +163,62 @@ class LiveStatus:
 
         name = payload.get("name", "")
         subagent = payload.get("subagent")
+        sub_id = payload.get("sub_id") or subagent  # fallback si el motor es viejo
         depth = payload.get("depth")
 
+        if kind == "subagent_start":
+            if subagent:
+                self.subagents_active[subagent] = depth or 1
+            self.main.push(f"🤖 subagent `{subagent}` (depth {depth}) start")
+            # Panel propio solo para subagentes de nivel 1 (los paralelos del orquestador).
+            if (depth == 1 and sub_id and sub_id not in self.panels
+                    and len(self.panels) < MAX_PANELS):
+                p = _Panel(label=subagent or "?", kind="subagent", start_time=time.time())
+                p.task = str(payload.get("task", ""))[:180]
+                p.wants_message = True
+                p.dirty = True
+                self.panels[sub_id] = p
+                self.panel_order.append(sub_id)
+            return
+
+        if kind == "subagent_end":
+            if subagent:
+                self.subagents_active.pop(subagent, None)
+                self.subagents_done.add(subagent)
+            self.main.push(f"✅ subagent `{subagent}` done")
+            p = self.panels.get(sub_id)
+            if p:
+                final = str(payload.get("final", ""))
+                p.state = "error" if self._looks_like_error(final, "") else "done"
+                p.final_preview = final[:500]
+                p.final_pending = True
+                p.dirty = True
+            return
+
+        # tool_call / tool_result — a su panel si esta tageado a uno conocido, sino al main.
+        target = self.panels.get(sub_id) if sub_id in self.panels else None
+
         if kind == "tool_call":
-            self.tools_called[name] += 1
+            p = target or self.main
+            p.tools_called[name] += 1
             args = payload.get("args") or {}
             summary = _summarize_args(name, args)
             icon = _TOOL_ICONS.get(name, "•")
-            prefix = f"`[{subagent}@{depth}]` " if subagent else ""
+            # En el panel del propio subagente no hace falta el prefijo [name@depth];
+            # solo lo usamos cuando el evento cae en el main (subagente sin panel / anidado).
+            prefix = "" if target else (f"`[{subagent}@{depth}]` " if subagent else "")
             line = f"{prefix}{icon} `{name}`"
             if summary:
-                line += f" — {discord.utils.escape_markdown(summary)[:120]}"
-            self._push_event(line)
+                line += f" — {discord.utils.escape_markdown(summary)[:100]}"
+            p.push(line)
 
-            if name == "spawn_subagent":
-                sub_name = args.get("name") or "?"
-                self.subagents_active[sub_name] = (depth or 0) + 1
         elif kind == "tool_result":
-            self.tools_finished[name] += 1
+            p = target or self.main
+            p.tools_finished[name] += 1
             result = str(payload.get("result", ""))
-            err = self._looks_like_error(result, name)
-            if err:
-                self.errors += 1
-                icon = "❌"
-                self._push_event(f"{icon} `{name}` → ERROR")
-            # exito de tool no merece linea propia (ya se ve el call)
-        elif kind == "subagent_start":
-            sub_name = subagent or "?"
-            self.subagents_active[sub_name] = depth or 1
-            self._push_event(f"🤖 subagent `{sub_name}` (depth {depth}) start")
-        elif kind == "subagent_end":
-            sub_name = subagent or "?"
-            self.subagents_active.pop(sub_name, None)
-            self.subagents_done.add(sub_name)
-            self._push_event(f"✅ subagent `{sub_name}` done")
-        # 'final' ya manejado arriba
-
-    def _push_event(self, line: str) -> None:
-        self.last_events.append(line)
-        if len(self.last_events) > MAX_LAST_EVENTS:
-            self.last_events = self.last_events[-MAX_LAST_EVENTS:]
+            if self._looks_like_error(result, name):
+                p.errors += 1
+                p.push(f"❌ `{name}` → ERROR")
 
     @staticmethod
     def _looks_like_error(result: str, tool_name: str) -> bool:
@@ -174,89 +235,147 @@ class LiveStatus:
                 return False
         return False
 
-    # --- corre en el event loop ---
+    # ── render loop: UNA accion de Discord por tick ─────────────────────
 
-    async def _ensure_message(self) -> None:
-        try:
-            async with self._async_lock:
-                if self.message is not None:
-                    return
-                embed = self._build_embed("working")
-                self.message = await self.channel.send(embed=embed)
-                self._last_edit = time.time()
-        except Exception:
-            log.exception("live_status: fallo creando mensaje")
-        finally:
-            self._creating = False
-
-    async def _do_edit(self) -> None:
-        async with self._async_lock:
-            if self.message is None:
-                self._dirty = False
+    async def _tick(self) -> None:
+        async with self._io_lock:
+            action = self._next_action()
+            if action is None:
                 return
-            self._dirty = False
-            self._last_edit = time.time()
-            embed = self._build_embed("working")
-            try:
-                await self.message.edit(embed=embed)
-            except discord.HTTPException as e:
-                log.warning("live_status: edit fallo (%s)", e)
-            except Exception:
-                log.exception("live_status: edit excep")
+            kind, unit = action
+            if kind == "create":
+                await self._create_message(unit)
+            else:
+                await self._edit_message(unit)
+
+    def _next_action(self):
+        """Elige la proxima accion (create/edit) de UNA sola unidad. Round-robin con
+        prioridad: (1) crear paneles nuevos, (2) reflejar los que terminaron, (3) ciclar
+        los sucios. Devuelve (kind, panel) o None."""
+        with self._lock:
+            units = [self.main] + [self.panels[k] for k in self.panel_order]
+            # 1. crear mensajes pendientes (paneles nuevos aparecen ~1/tick)
+            for u in units:
+                if u.message is None and u.wants_message:
+                    return ("create", u)
+            # 2. reflejar transiciones a done/error cuanto antes
+            for u in units:
+                if u.message is not None and u.final_pending:
+                    return ("edit", u)
+            # 3. ciclar los sucios
+            n = len(units)
+            for i in range(n):
+                u = units[(self._rr + i) % n]
+                if u.message is not None and u.dirty:
+                    self._rr = (self._rr + i + 1) % n
+                    return ("edit", u)
+        return None
+
+    async def _create_message(self, u: _Panel) -> None:
+        with self._lock:
+            embed = self._build_embed(u)
+            u.dirty = False
+            u.final_pending = False
+        try:
+            u.message = await self.channel.send(embed=embed)
+        except Exception:
+            log.exception("live_status: send fallo")
+
+    async def _edit_message(self, u: _Panel) -> None:
+        if u.message is None:
+            return
+        with self._lock:
+            embed = self._build_embed(u)
+            u.dirty = False
+            u.final_pending = False
+        try:
+            await u.message.edit(embed=embed)
+        except discord.HTTPException as e:
+            log.warning("live_status: edit fallo (%s)", e)
+        except Exception:
+            log.exception("live_status: edit excep")
+
+    # ── finalize: parar el loop y volcar todo al estado terminal ────────
 
     async def finalize(self, state: str = "done") -> None:
-        async with self._async_lock:
-            if self.message is None:
-                # nunca hubo eventos worth posting
-                return
-            embed = self._build_embed(state)
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
             try:
-                await self.message.edit(embed=embed)
-            except Exception:
-                log.exception("live_status: finalize edit fallo")
-
-    # --- construccion del embed ---
-
-    def _build_embed(self, state: str) -> discord.Embed:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         with self._lock:
-            elapsed = int(time.time() - self.start_time)
-            if state == "done":
-                color = _COLOR_DONE
-                title = f"✅ Listo · {elapsed}s"
-            elif state == "error":
-                color = _COLOR_ERROR
-                title = f"❌ Error · {elapsed}s"
-            else:
-                color = _COLOR_ERROR if self.errors else _COLOR_WORKING
-                title = f"🔄 Papolo trabajando · {elapsed}s"
+            self.main.state = state
+            self.main.final_pending = True
+            self.main.dirty = True
+            # Subagentes que quedaron 'working' (no emitieron end) se dan por terminados.
+            for p in self.panels.values():
+                if p.state == "working":
+                    p.state = "done"
+                p.final_pending = True
+                p.dirty = True
+        await self._flush_all()
 
-            embed = discord.Embed(title=title, color=color)
+    async def _flush_all(self) -> None:
+        async with self._io_lock:
+            units = [self.main] + [self.panels[k] for k in self.panel_order]
+            for u in units:
+                # discord.py maneja el 429 con backoff automatico, asi que este burst
+                # secuencial es seguro aunque haya varios paneles.
+                if u.message is None and u.wants_message:
+                    await self._create_message(u)
+                elif u.message is not None:
+                    await self._edit_message(u)
 
-            if self.last_events:
-                body = "\n".join(self.last_events[-MAX_LAST_EVENTS:])
-                embed.add_field(name="Actividad", value=body[:1024], inline=False)
+    # ── construccion del embed ──────────────────────────────────────────
 
-            if self.tools_called:
-                lines = []
-                for name, n in self.tools_called.most_common(12):
-                    fin = self.tools_finished.get(name, 0)
-                    icon = _TOOL_ICONS.get(name, "•")
-                    if fin == n:
-                        lines.append(f"{icon} `{name}` ×{n}")
-                    else:
-                        lines.append(f"{icon} `{name}` {fin}/{n}")
-                embed.add_field(name="Tools", value="\n".join(lines)[:1024], inline=True)
+    def _build_embed(self, p: _Panel) -> discord.Embed:
+        """Construye el embed de un panel. Llamar con _lock tomado."""
+        elapsed = int(time.time() - p.start_time)
+        if p.state == "done":
+            color = _COLOR_DONE
+            title = f"✅ {p.label} · Done · {elapsed}s"
+        elif p.state == "error":
+            color = _COLOR_ERROR
+            title = f"❌ {p.label} · Error · {elapsed}s"
+        else:
+            color = _COLOR_ERROR if p.errors else _COLOR_WORKING
+            title = f"🔄 {p.label} · trabajando · {elapsed}s"
 
-            if self.subagents_active or self.subagents_done:
-                lines = []
-                for n, d in self.subagents_active.items():
-                    lines.append(f"🤖 `{n}` (depth {d}) — activo")
-                for n in sorted(self.subagents_done):
-                    if n not in self.subagents_active:
-                        lines.append(f"✓ `{n}`")
-                embed.add_field(name="Subagentes", value="\n".join(lines)[:1024], inline=True)
+        embed = discord.Embed(title=title, color=color)
 
-            if self.errors:
-                embed.add_field(name="Errores", value=str(self.errors), inline=True)
+        if p.kind == "subagent" and p.task:
+            embed.description = f"_{discord.utils.escape_markdown(p.task)[:200]}_"
 
-            return embed
+        if p.events:
+            body = "\n".join(p.events[-MAX_LAST_EVENTS:])
+            embed.add_field(name="Actividad", value=body[:1024], inline=False)
+
+        if p.tools_called:
+            lines = []
+            for name, n in p.tools_called.most_common(10):
+                fin = p.tools_finished.get(name, 0)
+                icon = _TOOL_ICONS.get(name, "•")
+                if fin >= n:
+                    lines.append(f"{icon} `{name}` ×{n}")
+                else:
+                    lines.append(f"{icon} `{name}` {fin}/{n}")
+            embed.add_field(name="Tools", value="\n".join(lines)[:1024], inline=True)
+
+        # Roster compacto de subagentes, solo en el embed principal.
+        if p.kind == "main" and (self.subagents_active or self.subagents_done):
+            lines = []
+            for n, d in self.subagents_active.items():
+                lines.append(f"🤖 `{n}` (depth {d}) — activo")
+            for n in sorted(self.subagents_done):
+                if n not in self.subagents_active:
+                    lines.append(f"✓ `{n}`")
+            embed.add_field(name="Subagentes", value="\n".join(lines)[:1024], inline=True)
+
+        if p.errors:
+            embed.add_field(name="Errores", value=str(p.errors), inline=True)
+
+        if p.kind == "main" and p.state != "working" and p.final_preview:
+            embed.add_field(name="Resultado", value=p.final_preview[:1024], inline=False)
+
+        return embed

@@ -118,6 +118,7 @@ async def _run_agent_turn(agent: Agent, prompt: str,
             return await asyncio.to_thread(agent.send, prompt)
         loop = asyncio.get_running_loop()
         live = LiveStatus(channel=channel, loop=loop)
+        live.start()
         try:
             result = await asyncio.to_thread(agent.send, prompt, live.on_event)
         except Exception:
