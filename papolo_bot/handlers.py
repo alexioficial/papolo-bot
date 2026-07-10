@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -25,176 +26,66 @@ from .live_status import LiveStatus
 log = logging.getLogger("papolo-bot")
 
 
-def _build_transcript_md(conv: dict) -> str:
-    """Construye el .md con la conversacion Discord + el estado interno del agente."""
-    import json as _json
-    short = conv["uuid"].split("-")[0]
-    out: list[str] = []
-    out.append(f"# Transcripcion · papolo · {short}")
-    out.append("")
-    out.append(f"- UUID: `{conv['uuid']}`")
-    out.append(f"- Thread ID: `{conv['thread_id']}`")
-    out.append(f"- Creado: {conv['created_at']}")
-    out.append("")
-    out.append("---")
-    out.append("")
-    out.append("## Conversacion (lado Discord)")
-    out.append("")
-
-    msgs = db.get_messages(conv["uuid"])
-    for m in msgs:
-        author = m.get("author_name") or m["role"]
-        role = m["role"]
-        ts = m["created_at"]
-        icon = "🧑" if role == "user" else ("🤖" if role == "assistant" else "•")
-        out.append(f"### {icon} {author} ({role}) — {ts}")
-        out.append("")
-        content = (m.get("content") or "").strip()
-        if not content:
-            out.append("_(vacio)_")
-        else:
-            out.append(content)
-        out.append("")
-
-    out.append("---")
-    out.append("")
-    out.append("## Estado interno del agente (mensajes openai-style con tool calls/results)")
-    out.append("")
-
-    state = db.load_agent_state(conv["uuid"]) or []
-    # Los tool-result messages se guardan sin 'name'; mapeamos tool_call_id -> name
-    # desde los tool_calls de los mensajes assistant para poder rotularlos.
-    id_to_name: dict[str, str] = {}
-    for msg in state:
-        for tc in (msg.get("tool_calls") or []):
-            fn = tc.get("function") or {}
-            if tc.get("id"):
-                id_to_name[tc["id"]] = fn.get("name", "?")
-    for i, msg in enumerate(state):
-        role = msg.get("role", "?")
-        out.append(f"### [{i}] {role}")
-        out.append("")
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            preview = content if len(content) <= 6000 else (content[:6000] + f"\n…[truncated {len(content)-6000} chars]")
-            out.append("```")
-            out.append(preview)
-            out.append("```")
-            out.append("")
-
-        tool_calls = msg.get("tool_calls") or []
-        for tc in tool_calls:
-            fn = (tc.get("function") or {})
-            tname = fn.get("name", "?")
-            targs = fn.get("arguments", "")
-            try:
-                parsed = _json.loads(targs) if isinstance(targs, str) else targs
-                targs_pretty = _json.dumps(parsed, indent=2, ensure_ascii=False)
-            except Exception:
-                targs_pretty = str(targs)
-            if len(targs_pretty) > 4000:
-                targs_pretty = targs_pretty[:4000] + f"\n…[truncated {len(targs_pretty)-4000} chars]"
-            out.append(f"**tool_call:** `{tname}` (id: `{tc.get('id','?')}`)")
-            out.append("```json")
-            out.append(targs_pretty)
-            out.append("```")
-            out.append("")
-
-        if role == "tool":
-            tcid = msg.get("tool_call_id", "?")
-            tname = id_to_name.get(tcid, msg.get("name", "?"))
-            out.append(f"**tool result** for `{tname}` (call_id: `{tcid}`)")
-            out.append("")
-
-    return "\n".join(out)
-
-
 def _build_transcript_events(conv: dict) -> list[dict]:
-    """Transcript como lista de eventos JSON. Guarda TODO — sin truncar nada:
+    """Transcripcion COMPLETA como lista de eventos JSON — nada truncado.
 
-      - `meta`            : datos de la conversacion + conteos + fila cruda.
-      - `discord_message` : cada mensaje del lado Discord (fila completa de la DB).
-      - `agent_message`   : cada mensaje del estado interno del agente (dict
-                            openai-style CRUDO e integro: content, tool_calls con
-                            sus arguments completos, tool_call_id, name, etc.).
-      - `deployment`      : cada deployment registrado para la conversacion.
+    Cada evento es un dict con clave `type` que lo discrimina; no todos comparten
+    la misma estructura (por diseno). Se vuelca TODO:
+      - `meta`: datos de la conversacion + conteos.
+      - `discord_message`: cada mensaje del lado Discord con todas sus columnas.
+      - `agent_message`: cada mensaje openai-style del loop interno del agente,
+        con sus `tool_calls` (argumentos enteros) y, para los mensajes `tool`, el
+        resultado completo del tool en `content` (+ `tool_name` resuelto).
+      - `deployment`: cada fila del ledger de deployments de la conversacion.
 
-    Cada evento lleva al menos `seq` (orden global 0..N) y `type`. Mas alla de eso
-    la forma varia por tipo a proposito — cada evento carga lo suyo. El orden del
-    array preserva la secuencia real (mensajes Discord y pasos del loop del agente
-    en el orden en que ocurrieron)."""
-    import json as _json
-
-    events: list[dict] = []
-
-    def _push(ev: dict) -> None:
-        events.append({"seq": len(events), **ev})
-
+    Pensado para analisis maquina-legible (p.ej. reconstruir que hizo cada
+    subagente y en que orden), no para leer a ojo.
+    """
     short = conv["uuid"].split("-")[0]
-    msgs = db.get_messages(conv["uuid"])
-    state = db.load_agent_state(conv["uuid"]) or []
+    discord_msgs = db.get_messages(conv["uuid"])
+    agent_state = db.load_agent_state(conv["uuid"]) or []
     deployments = db.get_deployments_by_conv(conv["uuid"])
 
-    # 1) meta de la conversacion
-    _push({
+    events: list[dict] = []
+    _seq = 0
+
+    def emit(ev: dict) -> None:
+        nonlocal _seq
+        events.append({"seq": _seq, **ev})
+        _seq += 1
+
+    emit({
         "type": "meta",
-        "uuid": conv["uuid"],
         "short": short,
-        "thread_id": conv.get("thread_id"),
-        "guild_id": conv.get("guild_id"),
-        "channel_id": conv.get("channel_id"),
-        "created_by": conv.get("created_by"),
-        "created_at": conv.get("created_at"),
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "conversation": conv,
         "counts": {
-            "discord_messages": len(msgs),
-            "agent_messages": len(state),
+            "discord_messages": len(discord_msgs),
+            "agent_messages": len(agent_state),
             "deployments": len(deployments),
         },
-        "conversation_row": dict(conv),
     })
 
-    # 2) mensajes del lado Discord (fila completa, tal cual la DB)
-    for m in msgs:
-        _push({**dict(m), "type": "discord_message"})
+    for i, m in enumerate(discord_msgs):
+        emit({"type": "discord_message", "stream_index": i, **m})
 
-    # 3) estado interno del agente (openai-style, integro).
-    # Mapeo tool_call_id -> nombre de la tool para rotular los mensajes 'tool'.
+    # Los mensajes 'tool' se guardan sin 'name'; mapeamos tool_call_id -> name
+    # desde los tool_calls de los mensajes assistant para poder rotularlos.
     id_to_name: dict[str, str] = {}
-    for msg in state:
+    for msg in agent_state:
         for tc in (msg.get("tool_calls") or []):
             fn = tc.get("function") or {}
             if tc.get("id"):
                 id_to_name[tc["id"]] = fn.get("name", "?")
 
-    for i, msg in enumerate(state):
-        ev = {**msg, "type": "agent_message", "index": i}
+    for i, msg in enumerate(agent_state):
+        ev = {"type": "agent_message", "index": i, **msg}
         if msg.get("role") == "tool":
             ev["tool_name"] = id_to_name.get(msg.get("tool_call_id"), msg.get("name"))
-        # Los arguments de cada tool_call vienen como string JSON; los dejo tambien
-        # parseados por comodidad, SIN tocar el original (que queda en tool_calls).
-        parsed_calls = []
-        for tc in (msg.get("tool_calls") or []):
-            fn = tc.get("function") or {}
-            args = fn.get("arguments")
-            parsed = None
-            if isinstance(args, str):
-                try:
-                    parsed = _json.loads(args)
-                except Exception:
-                    parsed = None
-            parsed_calls.append({
-                "id": tc.get("id"),
-                "name": fn.get("name"),
-                "arguments_parsed": parsed,
-            })
-        if parsed_calls:
-            ev["tool_calls_parsed"] = parsed_calls
-        _push(ev)
+        emit(ev)
 
-    # 4) deployments registrados
-    for d in deployments:
-        _push({**dict(d), "type": "deployment"})
+    for i, d in enumerate(deployments):
+        emit({"type": "deployment", "stream_index": i, **d})
 
     return events
 
@@ -658,7 +549,7 @@ def setup(bot: commands.Bot) -> None:
 
     @bot.tree.command(
         name="papolo-transcript",
-        description="Exporta la conversacion + estado interno del agente (.json completo + .md legible)",
+        description="Exporta TODO (Discord + estado interno del agente + deployments) como .json",
     )
     async def papolo_transcript(interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.Thread):
@@ -674,49 +565,40 @@ def setup(bot: commands.Bot) -> None:
             return
 
         await interaction.response.defer(thinking=True)
-        import json as _json
         short = conv["uuid"].split("-")[0]
-
         events = _build_transcript_events(conv)
-        payload = _json.dumps(events, ensure_ascii=False, indent=2, default=str)
-        md = _build_transcript_md(conv)
-
-        tmp = Path(tempfile.gettempdir())
-        json_path = tmp / f"papolo-{short}-transcript.json"
-        md_path = tmp / f"papolo-{short}-transcript.md"
-        json_path.write_text(payload, encoding="utf-8")
-        md_path.write_text(md, encoding="utf-8")
-
-        LIMIT_MB = 24.5  # margen por debajo del limite de adjunto de Discord
+        payload = json.dumps(events, ensure_ascii=False, indent=2)
+        out_path = Path(tempfile.gettempdir()) / f"papolo-{short}-transcript.json"
+        out_path.write_text(payload, encoding="utf-8")
+        gz_path: Path | None = None
         try:
-            json_mb = json_path.stat().st_size / (1024 * 1024)
-            md_mb = md_path.stat().st_size / (1024 * 1024)
+            size_mb = out_path.stat().st_size / (1024 * 1024)
+            send_path, send_name = out_path, out_path.name
+            # Si el JSON completo supera el limite de Discord, lo comprimimos en
+            # vez de truncar: la transcripcion tiene que quedar entera.
+            if size_mb > 24.5:
+                import gzip
+                import shutil
 
-            if json_mb > LIMIT_MB:
-                await interaction.followup.send(
-                    f"El transcript JSON pesa {json_mb:.1f}MB y supera el limite de "
-                    f"Discord ({LIMIT_MB:.0f}MB). Usa `/papolo-download` para bajar el "
-                    f"repo + estado completo en un zip."
-                )
-                return
-
-            files = [discord.File(str(json_path), filename=json_path.name)]
-            note = ""
-            # Sumamos el .md legible solo si entra junto con el .json.
-            if json_mb + md_mb <= LIMIT_MB:
-                files.append(discord.File(str(md_path), filename=md_path.name))
-            else:
-                note = " · .md omitido por tamanio"
-
+                gz_path = out_path.with_name(out_path.name + ".gz")
+                with open(out_path, "rb") as fi, gzip.open(gz_path, "wb") as fo:
+                    shutil.copyfileobj(fi, fo)
+                gz_mb = gz_path.stat().st_size / (1024 * 1024)
+                if gz_mb > 24.5:
+                    await interaction.followup.send(
+                        f"Transcripcion demasiado grande incluso comprimida "
+                        f"({gz_mb:.1f}MB, {len(events):,} eventos)."
+                    )
+                    return
+                send_path, send_name, size_mb = gz_path, gz_path.name, gz_mb
             await interaction.followup.send(
-                content=(
-                    f"Transcript completo — {len(events)} eventos · "
-                    f"JSON {json_mb:.2f}MB{note}"
-                ),
-                files=files,
+                content=f"Transcripcion JSON ({len(events):,} eventos, {size_mb:.2f}MB):",
+                file=discord.File(str(send_path), filename=send_name),
             )
         finally:
-            for p in (json_path, md_path):
+            for p in (out_path, gz_path):
+                if p is None:
+                    continue
                 try:
                     p.unlink()
                 except OSError:
