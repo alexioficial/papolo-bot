@@ -4,8 +4,11 @@ import os
 import subprocess
 from pathlib import Path
 
+import discord
+
 from papolo import Agent
 from papolo import deploy as papolo_deploy
+from papolo import stackpick as papolo_stackpick
 
 from . import confirmations, db
 from .models import current_model, current_subagent_model
@@ -135,6 +138,73 @@ def _confirmation_callback(conv_uuid: str, action: str, target: str,
     return ("INVALID", "token invalido o expirado")
 
 
+# --- Wiring de tech stack (ask_tech_stack) ---
+
+# Emojis de teclado 1..7 para el menu por reacciones (alcanza para 3 frontend / 4 backend).
+_NUMBER_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣",
+                  "5️⃣", "6️⃣", "7️⃣"]
+_STACK_PICK_TIMEOUT = 300  # 5 min por eleccion; al vencer cae al default (opcion 1)
+
+
+async def _pick_one(channel, label: str, options: list) -> str:
+    """Postea un menu numerado, espera la reaccion del usuario y devuelve la key elegida.
+    Si nadie elige en _STACK_PICK_TIMEOUT, cae a la primera opcion."""
+    emojis = _NUMBER_EMOJIS[: len(options)]
+    body = [f"**Elegí el {label.lower()}** (reaccioná con el número):"]
+    for emo, (_key, human) in zip(emojis, options):
+        body.append(f"{emo}  {human}")
+    msg = await channel.send("\n".join(body))
+    for emo in emojis:
+        try:
+            await msg.add_reaction(emo)
+        except discord.HTTPException:
+            pass
+
+    def check(reaction, user):
+        return (
+            reaction.message.id == msg.id
+            and not user.bot
+            and str(reaction.emoji) in emojis
+        )
+
+    try:
+        reaction, _user = await _bot.wait_for(
+            "reaction_add", timeout=_STACK_PICK_TIMEOUT, check=check
+        )
+        idx = emojis.index(str(reaction.emoji))
+    except asyncio.TimeoutError:
+        idx = 0
+        await channel.send(
+            f"No hubo elección para {label.lower()} en {_STACK_PICK_TIMEOUT // 60} min — "
+            f"uso **{options[0][1]}** por defecto."
+        )
+    key, human = options[idx]
+    await channel.send(f"{label}: **{human}** ✓")
+    return key
+
+
+def _stack_callback(conversation_uuid: str, frontend_options: list,
+                    backend_options: list) -> tuple:
+    """Llamado desde el thread sync del agente (tool ask_tech_stack). Bloquea hasta que
+    el usuario elige frontend y backend por reacciones. Devuelve (frontend_key, backend_key)."""
+    if not (_bot and _loop):
+        raise RuntimeError("bot/loop no disponibles todavia")
+    thread_id = _get_thread_id(conversation_uuid)
+    if not thread_id:
+        raise RuntimeError("no se encontro el thread de la conversacion")
+
+    async def _ask():
+        ch = _bot.get_channel(thread_id) or await _bot.fetch_channel(thread_id)
+        fe = await _pick_one(ch, "Frontend", frontend_options)
+        be = await _pick_one(ch, "Backend", backend_options)
+        return fe, be
+
+    fut = asyncio.run_coroutine_threadsafe(_ask(), _loop)
+    # Techo de seguridad por encima de los dos timeouts internos (300s c/u + margen).
+    return fut.result(timeout=_STACK_PICK_TIMEOUT * 2 + 60)
+
+
 # Registrar callbacks al import — corre una vez por proceso.
 papolo_deploy.set_db_callback(db.handle_deploy_event)
 papolo_deploy.set_confirmation_callback(_confirmation_callback)
+papolo_stackpick.set_stack_callback(_stack_callback)
