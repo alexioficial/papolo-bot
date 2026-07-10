@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from papolo import Agent
+from papolo import deploy as papolo_deploy
 from papolo.skills import list_skills
 from papolo.subagents import list_subagents
 
@@ -105,6 +106,138 @@ def _build_transcript_md(conv: dict) -> str:
             out.append("")
 
     return "\n".join(out)
+
+
+def _purge_field(lines: list[str], empty: str = "—") -> str:
+    """Une lineas respetando el limite de 1024 chars por field de embed."""
+    if not lines:
+        return empty
+    text = "\n".join(lines)
+    if len(text) > 1000:
+        text = text[:1000].rsplit("\n", 1)[0] + f"\n… (+{len(lines)} en total)"
+    return text or empty
+
+
+def _purge_preview_embed(targets: dict) -> discord.Embed:
+    emb = discord.Embed(
+        title="🧹 Limpieza total de Papolo",
+        description=(
+            "Voy a borrar **de forma irreversible** SOLO lo que Papolo creó en tu "
+            "GitHub, Coolify y MongoDB. Nada más tuyo se toca. Revisá la lista y confirmá."
+        ),
+        color=0xED4245,
+    )
+
+    def svc_lines(enabled, items, err, fmt):
+        if not enabled:
+            return ["(no configurado)"]
+        if err:
+            return [f"⚠️ {err}"]
+        if not items:
+            return ["(nada)"]
+        return [fmt(x) for x in items]
+
+    gh, cf, mo = targets["github"], targets["coolify"], targets["mongo"]
+    emb.add_field(
+        name=f"GitHub · {len(gh['repos'])} repos",
+        value=_purge_field(svc_lines(gh["enabled"], gh["repos"], gh["error"], lambda n: f"• {n}")),
+        inline=False,
+    )
+    emb.add_field(
+        name=f"Coolify · {len(cf['apps'])} apps",
+        value=_purge_field(svc_lines(cf["enabled"], cf["apps"], cf["error"],
+                                     lambda a: f"• {a['name']} ({a['fqdn']})")),
+        inline=False,
+    )
+    emb.add_field(
+        name=f"MongoDB · {len(mo['dbs'])} bases",
+        value=_purge_field(svc_lines(mo["enabled"], mo["dbs"], mo["error"], lambda d: f"• {d}")),
+        inline=False,
+    )
+    return emb
+
+
+def _purge_results_embed(results: dict) -> discord.Embed:
+    c = results["counts"]
+    any_fail = any(not x["ok"] for k in ("github", "coolify", "mongo") for x in results[k])
+    emb = discord.Embed(
+        title="🧹 Limpieza con avisos" if any_fail else "🧹 Limpieza completada",
+        color=0xFEE75C if any_fail else 0x57F287,
+    )
+
+    def svc_block(items):
+        oks = sum(1 for x in items if x["ok"])
+        fails = [x for x in items if not x["ok"]]
+        lines = [f"✅ {oks} borrados"]
+        for f in fails[:8]:
+            lines.append(f"❌ {f['target']}: {f['msg']}")
+        return _purge_field(lines)
+
+    emb.add_field(name=f"GitHub ({c['github']})", value=svc_block(results["github"]), inline=False)
+    emb.add_field(name=f"Coolify ({c['coolify']})", value=svc_block(results["coolify"]), inline=False)
+    emb.add_field(name=f"MongoDB ({c['mongo']})", value=svc_block(results["mongo"]), inline=False)
+    return emb
+
+
+class _PurgeConfirmView(discord.ui.View):
+    """Confirmacion de doble paso para /papolo-purge (op destructiva e irreversible)."""
+
+    def __init__(self, invoker_id: int, targets: dict):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.targets = targets
+        self.done = False
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Solo quien invocó el comando puede confirmar.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Borrar todo", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="🧹 Borrando todo lo que Papolo creó… (puede tardar unos segundos)",
+            embed=None, view=self,
+        )
+        try:
+            results = await asyncio.to_thread(papolo_deploy.purge_execute, self.targets)
+            await asyncio.to_thread(db.delete_all_deployments)
+        except Exception as e:
+            log.exception("purge error")
+            await interaction.edit_original_response(
+                content=f"ERROR durante la purga: {e}", embed=None, view=None
+            )
+            self.stop()
+            return
+        await interaction.edit_original_response(
+            content=None, embed=_purge_results_embed(results), view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        await interaction.response.edit_message(
+            content="Cancelado. No se borró nada.", embed=None, view=None
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.done or self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="Expiró la confirmación. No se borró nada.", embed=None, view=None
+            )
+        except discord.HTTPException:
+            pass
 
 
 async def _run_agent_turn(agent: Agent, prompt: str,
@@ -550,6 +683,48 @@ def setup(bot: commands.Bot) -> None:
         persist_agent(conv["uuid"], agent)
         await send_long(interaction.channel, result)
         await interaction.followup.send("Listo.")
+
+    @bot.tree.command(
+        name="papolo-purge",
+        description="Borra TODO lo que Papolo creó (GitHub, Coolify, MongoDB). Solo lo suyo. Irreversible.",
+    )
+    async def papolo_purge(interaction: discord.Interaction):
+        # Op destructiva global: la limitamos a admins del server.
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and perms.administrator):
+            await interaction.response.send_message(
+                "Solo un administrador del servidor puede usar esto.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        repo_names, app_uuids = db.all_papolo_resources()
+        try:
+            targets = await asyncio.to_thread(
+                papolo_deploy.purge_targets, repo_names, app_uuids
+            )
+        except Exception as e:
+            log.exception("purge_targets error")
+            await interaction.followup.send(
+                f"ERROR reuniendo recursos: {e}", ephemeral=True
+            )
+            return
+
+        embed = _purge_preview_embed(targets)
+        if papolo_deploy.purge_total(targets) == 0:
+            embed.title = "🧹 Nada para borrar"
+            embed.color = 0x57F287
+            embed.description = (
+                "No encontré recursos creados por Papolo en GitHub, Coolify ni MongoDB."
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        view = _PurgeConfirmView(interaction.user.id, targets)
+        msg = await interaction.followup.send(
+            embed=embed, view=view, ephemeral=True, wait=True
+        )
+        view.message = msg
 
     @bot.event
     async def on_message(message: discord.Message):

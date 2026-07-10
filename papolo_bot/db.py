@@ -286,6 +286,28 @@ def get_deployments_by_conv(conversation_uuid: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def all_papolo_resources() -> tuple[list[str], list[str]]:
+    """Todos los repos GitHub y apps Coolify que Papolo registro y que no estan
+    marcados como destruidos. Fuente conocida para la purga (se combina con la
+    enumeracion en vivo de cada servicio)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT github_repo_name, coolify_app_uuid FROM deployments "
+            "WHERE status != 'destroyed'"
+        ).fetchall()
+    repos = sorted({r["github_repo_name"] for r in rows if r["github_repo_name"]})
+    apps = sorted({r["coolify_app_uuid"] for r in rows if r["coolify_app_uuid"]})
+    return repos, apps
+
+
+def delete_all_deployments() -> int:
+    """Vacia el ledger de deployments. Se usa tras una purga total: los recursos
+    reales ya no existen, dejar filas vivas mostraria links muertos en /papolo-status."""
+    with connect() as c:
+        cur = c.execute("DELETE FROM deployments")
+        return cur.rowcount
+
+
 def handle_deploy_event(event: str, payload: dict):
     """Callback que pasamos al modulo papolo.deploy. Persiste eventos en SQLite.
 
