@@ -16,7 +16,7 @@ from papolo import deploy as papolo_deploy
 from papolo.skills import list_skills
 from papolo.subagents import list_subagents
 
-from . import active_turns, confirmations, conversations, db, models
+from . import active_turns, attachments, confirmations, conversations, db, models
 from .conversations import bind_bot, get_or_create_agent, persist_agent, workspace_path
 from .discord_helpers import fetch_reply_context, format_user_turn, send_ephemeral_long, send_long
 from .live_status import LiveStatus
@@ -744,6 +744,15 @@ def setup(bot: commands.Bot) -> None:
             message.content,
             reply_ctx,
         )
+
+        # Adjuntos de texto/codigo enviados en el thread: inyectarlos como contexto.
+        try:
+            attach_block = await attachments.collect_text_attachments(message)
+        except Exception:
+            log.exception("Error procesando adjuntos del mensaje %s", message.id)
+            attach_block = None
+        if attach_block:
+            formatted = f"{formatted}\n\n{attach_block}"
 
         db.save_message(
             conversation_uuid=conv_uuid,
