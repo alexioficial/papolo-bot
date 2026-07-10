@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import uuid as uuid_lib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -106,6 +107,96 @@ def _build_transcript_md(conv: dict) -> str:
             out.append("")
 
     return "\n".join(out)
+
+
+def _build_transcript_events(conv: dict) -> list[dict]:
+    """Transcript como lista de eventos JSON. Guarda TODO — sin truncar nada:
+
+      - `meta`            : datos de la conversacion + conteos + fila cruda.
+      - `discord_message` : cada mensaje del lado Discord (fila completa de la DB).
+      - `agent_message`   : cada mensaje del estado interno del agente (dict
+                            openai-style CRUDO e integro: content, tool_calls con
+                            sus arguments completos, tool_call_id, name, etc.).
+      - `deployment`      : cada deployment registrado para la conversacion.
+
+    Cada evento lleva al menos `seq` (orden global 0..N) y `type`. Mas alla de eso
+    la forma varia por tipo a proposito — cada evento carga lo suyo. El orden del
+    array preserva la secuencia real (mensajes Discord y pasos del loop del agente
+    en el orden en que ocurrieron)."""
+    import json as _json
+
+    events: list[dict] = []
+
+    def _push(ev: dict) -> None:
+        events.append({"seq": len(events), **ev})
+
+    short = conv["uuid"].split("-")[0]
+    msgs = db.get_messages(conv["uuid"])
+    state = db.load_agent_state(conv["uuid"]) or []
+    deployments = db.get_deployments_by_conv(conv["uuid"])
+
+    # 1) meta de la conversacion
+    _push({
+        "type": "meta",
+        "uuid": conv["uuid"],
+        "short": short,
+        "thread_id": conv.get("thread_id"),
+        "guild_id": conv.get("guild_id"),
+        "channel_id": conv.get("channel_id"),
+        "created_by": conv.get("created_by"),
+        "created_at": conv.get("created_at"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "counts": {
+            "discord_messages": len(msgs),
+            "agent_messages": len(state),
+            "deployments": len(deployments),
+        },
+        "conversation_row": dict(conv),
+    })
+
+    # 2) mensajes del lado Discord (fila completa, tal cual la DB)
+    for m in msgs:
+        _push({**dict(m), "type": "discord_message"})
+
+    # 3) estado interno del agente (openai-style, integro).
+    # Mapeo tool_call_id -> nombre de la tool para rotular los mensajes 'tool'.
+    id_to_name: dict[str, str] = {}
+    for msg in state:
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            if tc.get("id"):
+                id_to_name[tc["id"]] = fn.get("name", "?")
+
+    for i, msg in enumerate(state):
+        ev = {**msg, "type": "agent_message", "index": i}
+        if msg.get("role") == "tool":
+            ev["tool_name"] = id_to_name.get(msg.get("tool_call_id"), msg.get("name"))
+        # Los arguments de cada tool_call vienen como string JSON; los dejo tambien
+        # parseados por comodidad, SIN tocar el original (que queda en tool_calls).
+        parsed_calls = []
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            parsed = None
+            if isinstance(args, str):
+                try:
+                    parsed = _json.loads(args)
+                except Exception:
+                    parsed = None
+            parsed_calls.append({
+                "id": tc.get("id"),
+                "name": fn.get("name"),
+                "arguments_parsed": parsed,
+            })
+        if parsed_calls:
+            ev["tool_calls_parsed"] = parsed_calls
+        _push(ev)
+
+    # 4) deployments registrados
+    for d in deployments:
+        _push({**dict(d), "type": "deployment"})
+
+    return events
 
 
 def _purge_field(lines: list[str], empty: str = "—") -> str:
@@ -567,7 +658,7 @@ def setup(bot: commands.Bot) -> None:
 
     @bot.tree.command(
         name="papolo-transcript",
-        description="Exporta la conversacion + estado interno del agente como .md",
+        description="Exporta la conversacion + estado interno del agente (.json completo + .md legible)",
     )
     async def papolo_transcript(interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.Thread):
@@ -583,26 +674,53 @@ def setup(bot: commands.Bot) -> None:
             return
 
         await interaction.response.defer(thinking=True)
+        import json as _json
         short = conv["uuid"].split("-")[0]
+
+        events = _build_transcript_events(conv)
+        payload = _json.dumps(events, ensure_ascii=False, indent=2, default=str)
         md = _build_transcript_md(conv)
-        out_path = Path(tempfile.gettempdir()) / f"papolo-{short}-transcript.md"
-        out_path.write_text(md, encoding="utf-8")
+
+        tmp = Path(tempfile.gettempdir())
+        json_path = tmp / f"papolo-{short}-transcript.json"
+        md_path = tmp / f"papolo-{short}-transcript.md"
+        json_path.write_text(payload, encoding="utf-8")
+        md_path.write_text(md, encoding="utf-8")
+
+        LIMIT_MB = 24.5  # margen por debajo del limite de adjunto de Discord
         try:
-            size_mb = out_path.stat().st_size / (1024 * 1024)
-            if size_mb > 24.5:
+            json_mb = json_path.stat().st_size / (1024 * 1024)
+            md_mb = md_path.stat().st_size / (1024 * 1024)
+
+            if json_mb > LIMIT_MB:
                 await interaction.followup.send(
-                    f"Transcripcion supera el limite de Discord ({size_mb:.1f}MB)."
+                    f"El transcript JSON pesa {json_mb:.1f}MB y supera el limite de "
+                    f"Discord ({LIMIT_MB:.0f}MB). Usa `/papolo-download` para bajar el "
+                    f"repo + estado completo en un zip."
                 )
                 return
+
+            files = [discord.File(str(json_path), filename=json_path.name)]
+            note = ""
+            # Sumamos el .md legible solo si entra junto con el .json.
+            if json_mb + md_mb <= LIMIT_MB:
+                files.append(discord.File(str(md_path), filename=md_path.name))
+            else:
+                note = " · .md omitido por tamanio"
+
             await interaction.followup.send(
-                content=f"Transcripcion ({size_mb:.2f}MB, {len(md):,} chars):",
-                file=discord.File(str(out_path), filename=f"papolo-{short}-transcript.md"),
+                content=(
+                    f"Transcript completo — {len(events)} eventos · "
+                    f"JSON {json_mb:.2f}MB{note}"
+                ),
+                files=files,
             )
         finally:
-            try:
-                out_path.unlink()
-            except OSError:
-                pass
+            for p in (json_path, md_path):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
 
     @bot.tree.command(
         name="papolo-status",
